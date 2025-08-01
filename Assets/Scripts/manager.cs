@@ -4,7 +4,8 @@ using UnityEngine;
 
 public class manager : MonoBehaviour
 {
-    // Start is called before the first frame update
+    public bool slowmode = false;
+
     void Start()
     {
         
@@ -13,6 +14,14 @@ public class manager : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
+        if (slowmode)
+        {
+            Time.timeScale = 0.1f; // Slow down time
+        }
+        else
+        {
+            Time.timeScale = 1f; // Normal speed
+        }
         
     }
 }
