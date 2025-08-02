@@ -299,9 +299,10 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 910e6ff2e7cff8f41bd320ca66912e2a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  centerObject: {fileID: 830991209}
-  orbitSpeed: 2
-  throttleSpeed: 2
+  centerObject: {fileID: 0}
+  linearOrbitSpeed: 5
+  throttleSpeed: 8
+  throttleKey: 32
 --- !u!4 &402868637 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 8694411542351394570, guid: 70d180730b8fd754b9ff672ff456eef3, type: 3}

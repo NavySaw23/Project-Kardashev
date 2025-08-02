@@ -10,7 +10,6 @@ GameObject:
   m_Component:
   - component: {fileID: 8694411542351394570}
   - component: {fileID: 1810200907724679648}
-  - component: {fileID: 4871591199382397052}
   - component: {fileID: 8279124839020949624}
   m_Layer: 0
   m_Name: CelestialBody
@@ -86,20 +85,6 @@ SpriteRenderer:
   m_WasSpriteAssigned: 1
   m_MaskInteraction: 0
   m_SpriteSortPoint: 0
---- !u!114 &4871591199382397052
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 7740917305883039060}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 02eeafbb6eeab5c4cbd6a37198b48370, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  centerObject: {fileID: 0}
-  orbitSpeed: 1
 --- !u!96 &8279124839020949624
 TrailRenderer:
   serializedVersion: 3
