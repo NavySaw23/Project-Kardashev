@@ -51,10 +51,10 @@ public class SimpleGravitationalBody2D : MonoBehaviour
         float minForceThreshold = 0.01f;
         influenceRadius = Mathf.Sqrt(strength / minForceThreshold);
 
-        if (showGravityField)
-        {
-            Debug.Log($"[GRAVITY] {name} - Strength: {strength}, Influence Radius: {influenceRadius:F2}");
-        }
+        //if (showGravityField)
+        //{
+        //    Debug.Log($"[GRAVITY] {name} - Strength: {strength}, Influence Radius: {influenceRadius:F2}");
+        //}
     }
 
     void OnValidate()
