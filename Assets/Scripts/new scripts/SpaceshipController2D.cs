@@ -1,16 +1,12 @@
 ﻿/*****************************************************************************
- *  SpaceshipController2D.cs
- *  -------------------------------------------------------------------------
- *  Boost re-work: the ship can now accelerate rapidly while remaining in a
- *  locked orbit.  The boost system no longer fights the tangential-hold
- *  controller; instead, the reference speed is synchronised every frame
- *  while boosting.
- *
- *  Key changes (look for // *** MODIFIED *** comments):
- *  1.  Tangential-hold logic only runs when NOT boosting.
- *  2.  While boosting, lockedTangentialSpeed is updated instantly so the
- *      hold system never counter-acts the extra speed.
- *****************************************************************************/
+* SpaceshipController2D.cs - Mouse Control with Fixed Orbital Mechanics
+* -------------------------------------------------------------------------
+* Mouse Controls:
+* - Left Mouse: Orbit lock/maintain
+* - Shift: Boost (free body or orbital boost)
+* - Ctrl: Break/slow down
+* - Scroll Wheel: Change orbit radius when in orbit
+*****************************************************************************/
 
 using UnityEngine;
 using TMPro;
@@ -20,12 +16,13 @@ using System.Collections.Generic;
 public class SpaceshipController2D : MonoBehaviour
 {
     /*────────────────────────── INSPECTOR ──────────────────────────*/
-    [Header("Controls")]
-    public KeyCode thrustKey = KeyCode.Space;
-    public KeyCode orbitDecreaseKey = KeyCode.LeftControl;
-    public KeyCode orbitBreakKey = KeyCode.C;
-    public KeyCode manualLockKey = KeyCode.X;
+    [Header("Mouse Controls")]
     public KeyCode boostKey = KeyCode.LeftShift;
+    public KeyCode breakKey = KeyCode.LeftControl;
+
+    [Header("Mobile UI Support")]
+    public bool isMobileMode = false;
+    public bool boostToggleEnabled = false;
 
     [Header("Ship")]
     public float shipMass = 10f;
@@ -36,28 +33,21 @@ public class SpaceshipController2D : MonoBehaviour
     public float minimumGravityDistance = 2f;
 
     [Header("Orbit System")]
-    public float orbitRadiusChangeSpeed = 5f;
-    public float minimumOrbitRadius = 1.5f;
-    public float orbitTransitionSpeed = 10f;
-    public float orbitalSpeedBoost = 1.5f;
-
-    [Header("Orbit-Assistance")]
-    public bool enableOrbitAssistance = true;
-    public float radialAssistForce = 20f;
-    public float maxRadialApproachSpeed = 3f;
-    public float tangentialHoldTolerance = 0.2f;
-    public float tangentialHoldForce = 6f;
+    public float baseOrbitalSpeed = 5f;
+    public float orbitRadiusChangeSpeed = 3f;
+    public float minimumOrbitRadius = 3f;
+    public float maximumOrbitRadius = 50f;
+    public float orbitalBoostMultiplier = 2f;
 
     [Header("Debug")]
     public bool enableDebugLogs = true;
-    public bool logOrbitPhysics = true;
-    public bool logBoostDetails = true;
-    public bool logForces = true;
+    public bool logOrbitPhysics = false;
 
     [Header("Fuel")]
     public float maxFuel = 100f;
     public float thrustFuelConsumption = 15f;
     public float boostFuelConsumption = 25f;
+    public float breakFuelConsumption = 10f;
 
     [Header("UI")]
     public TMP_Text speedText;
@@ -80,14 +70,17 @@ public class SpaceshipController2D : MonoBehaviour
     Rigidbody2D rb;
     readonly List<SimpleGravitationalBody2D> gravityBodies = new();
 
-    bool isThrusting, isBoosting, isOrbitLocked;
+    // Input states
+    bool isThrusting, isBoosting, isOrbitLocked, isBreaking;
+    bool orbitHeld, boostHeld, breakHeld;
     float currentFuel;
 
     /* orbit-state */
     SimpleGravitationalBody2D lockedBody;
-    float currentOrbitRadius, targetOrbitRadius;
-    float orbitDirection = 1f;          // +1 = CCW, −1 = CW
-    float lockedTangentialSpeed = 0f;   // reference tangential speed
+    float orbitRadius = 10f;
+    float orbitAngle = 0f;
+    float currentOrbitalSpeed;
+    float orbitDirection = 1f; // +1 = CCW, −1 = CW
 
     /* speedometer */
     float needleRotation = 98f;
@@ -96,7 +89,6 @@ public class SpaceshipController2D : MonoBehaviour
     /* debug tracking */
     float debugTimer = 0f;
     const float DEBUG_INTERVAL = 0.5f;
-    Vector2 lastVelocity;
 
     /*────────────────────────── UNITY ───────────────────────────*/
     void Awake()
@@ -105,8 +97,9 @@ public class SpaceshipController2D : MonoBehaviour
         rb.mass = shipMass;
         rb.gravityScale = 0f;
         rb.drag = 0f;
-
         currentFuel = maxFuel;
+        currentOrbitalSpeed = baseOrbitalSpeed;
+
         if (lineDrawerObject) lineDrawerObject.SetActive(false);
     }
 
@@ -123,12 +116,28 @@ public class SpaceshipController2D : MonoBehaviour
 
     void FixedUpdate()
     {
-        if (isOrbitLocked) HandleOrbitPhysics();
-        else ApplyGravity();
+        if (isOrbitLocked)
+        {
+            HandleOrbitalMovement();
+            ApplyMinorGravitationalInfluences();
+        }
+        else
+        {
+            ApplyGravity();
+            if (isThrusting && HasFuel()) ApplyThrust();
+        }
 
-        if (isThrusting && HasFuel()) ApplyThrust();
-        RotateSpriteToVelocity();
-        CapSpeed();
+        if (isBreaking && HasFuel()) ApplyBreaking();
+
+        if (!isOrbitLocked)
+        {
+            RotateSpriteToVelocity();
+            CapSpeed();
+        }
+        else
+        {
+            RotateSpriteToOrbitalDirection();
+        }
 
         /* Periodic debug */
         if (enableDebugLogs)
@@ -142,70 +151,140 @@ public class SpaceshipController2D : MonoBehaviour
         }
     }
 
-    /*────────────────────────── INPUT ───────────────────────────*/
+    /*────────────────────────── MOUSE INPUT ───────────────────────────*/
     void HandleInput()
     {
-        bool spaceHeld = Input.GetKey(thrustKey);
-        bool ctrlHeld = Input.GetKey(orbitDecreaseKey);
-        bool breakKey = Input.GetKeyDown(orbitBreakKey);
-        bool lockKey = Input.GetKeyDown(manualLockKey);
-        bool boostHeld = Input.GetKey(boostKey);
+        // Read input states
+        orbitHeld = Input.GetMouseButton(0) || (isMobileMode && false); // Left mouse button
+        boostHeld = Input.GetKey(boostKey) || (isMobileMode && boostToggleEnabled);
+        breakHeld = Input.GetKey(breakKey);
 
-        bool wasThrusting = isThrusting;
-        bool wasBoosting = isBoosting;
-
-        isThrusting = spaceHeld && HasFuel();
-        isBoosting = boostHeld && isOrbitLocked && HasFuel();
-
-        /* Debug input changes */
-        if (enableDebugLogs)
-        {
-            if (isThrusting && !wasThrusting) Debug.Log("[INPUT] Started thrusting");
-            if (!isThrusting && wasThrusting) Debug.Log("[INPUT] Stopped thrusting");
-            if (isBoosting && !wasBoosting) Debug.Log("[INPUT] Started boosting");
-            if (!isBoosting && wasBoosting) Debug.Log("[INPUT] Stopped boosting");
-        }
-
-        if (isThrusting) ConsumeFuel(thrustFuelConsumption);
-        if (isBoosting) ConsumeFuel(boostFuelConsumption);
-
-        /* Try manual orbit lock */
-        if (!isOrbitLocked && lockKey)
-        {
-            SimpleGravitationalBody2D body = GetNearestBody();
-            if (body && Vector2.Distance(transform.position, body.transform.position) <= body.GetInfluenceRadius() * 0.8f)
-            {
-                Debug.Log($"[ORBIT] Attempting to lock to {body.name}");
-                LockIntoOrbit(body);
-            }
-            else
-            {
-                Debug.Log("[ORBIT] No suitable body for orbit lock");
-            }
-        }
-
-        /* While locked */
+        // Handle scroll wheel for orbit radius adjustment
         if (isOrbitLocked)
         {
-            if (breakKey)
+            float scroll = Input.GetAxis("Mouse ScrollWheel");
+            if (scroll != 0f)
             {
-                Debug.Log("[ORBIT] Breaking orbit manually");
-                BreakOrbit();
+                orbitRadius += scroll * orbitRadiusChangeSpeed;
+                orbitRadius = Mathf.Clamp(orbitRadius, minimumOrbitRadius, maximumOrbitRadius);
+
+                if (enableDebugLogs)
+                    Debug.Log($"[ORBIT] Radius adjusted to: {orbitRadius:F2}");
             }
-            else if (spaceHeld && HasFuel())
-            {
-                targetOrbitRadius += orbitRadiusChangeSpeed * Time.deltaTime;
-            }
-            else if (ctrlHeld && HasFuel())
-            {
-                targetOrbitRadius = Mathf.Max(minimumOrbitRadius,
-                                              targetOrbitRadius - orbitRadiusChangeSpeed * Time.deltaTime);
-            }
+        }
+
+        // Reset states
+        isThrusting = false;
+        isBoosting = false;
+        isBreaking = false;
+
+        // Apply breaking if break button is held
+        if (breakHeld)
+        {
+            isBreaking = true;
+        }
+
+        // Determine ship state based on button combinations
+        if (boostHeld && orbitHeld)
+        {
+            // Both: Boost while orbiting
+            HandleBoostingInOrbit();
+        }
+        else if (boostHeld && !orbitHeld)
+        {
+            // Boost only: Free body boosting
+            HandleFreeBodyBoost();
+        }
+        else if (!boostHeld && orbitHeld)
+        {
+            // Orbit only: Pure orbital flight
+            HandleOrbitOnly();
+        }
+        else
+        {
+            // Neither: Free flight or break orbit
+            HandleFreeFlightOrBreakOrbit();
         }
     }
 
-    /*────────────────────── ORBIT PHYSICS ───────────────────────*/
-    void HandleOrbitPhysics()
+    void HandleBoostingInOrbit()
+    {
+        if (!HasFuel()) return;
+
+        // Try to lock into orbit if not already locked
+        if (!isOrbitLocked)
+        {
+            SimpleGravitationalBody2D nearestBody = GetNearestBody();
+            if (nearestBody && Vector2.Distance(transform.position, nearestBody.transform.position) <= nearestBody.GetInfluenceRadius() * 0.8f)
+            {
+                LockIntoOrbit(nearestBody);
+            }
+        }
+
+        // Set states for boosting while orbiting
+        isBoosting = true;
+
+        if (enableDebugLogs)
+            Debug.Log("[INPUT] Boosting while orbiting");
+    }
+
+    void HandleFreeBodyBoost()
+    {
+        if (!HasFuel()) return;
+
+        // Break orbit if currently locked
+        if (isOrbitLocked)
+        {
+            BreakOrbit();
+            if (enableDebugLogs)
+                Debug.Log("[INPUT] Breaking orbit to boost as free body");
+        }
+
+        // Set states for free body boosting
+        isThrusting = true;
+
+        if (enableDebugLogs)
+            Debug.Log("[INPUT] Free body boosting");
+    }
+
+    void HandleOrbitOnly()
+    {
+        // Try to lock into orbit if not already locked
+        if (!isOrbitLocked)
+        {
+            SimpleGravitationalBody2D nearestBody = GetNearestBody();
+            if (nearestBody && Vector2.Distance(transform.position, nearestBody.transform.position) <= nearestBody.GetInfluenceRadius() * 0.8f)
+            {
+                LockIntoOrbit(nearestBody);
+                if (enableDebugLogs)
+                    Debug.Log("[INPUT] Locking into orbit");
+            }
+            else if (enableDebugLogs)
+            {
+                Debug.Log("[INPUT] Attempting to orbit but no suitable body nearby");
+            }
+        }
+
+        if (enableDebugLogs && isOrbitLocked)
+            Debug.Log("[INPUT] Maintaining orbit");
+    }
+
+    void HandleFreeFlightOrBreakOrbit()
+    {
+        // Break orbit when orbit button is released
+        if (isOrbitLocked)
+        {
+            BreakOrbit();
+            if (enableDebugLogs)
+                Debug.Log("[INPUT] Breaking orbit - returning to free flight");
+        }
+
+        if (enableDebugLogs)
+            Debug.Log("[INPUT] Free flight mode");
+    }
+
+    /*────────────────────── ORBITAL MECHANICS ───────────────────────*/
+    void HandleOrbitalMovement()
     {
         if (!lockedBody)
         {
@@ -214,94 +293,75 @@ public class SpaceshipController2D : MonoBehaviour
             return;
         }
 
-        /* Geometry */
         Vector2 center = lockedBody.transform.position;
-        Vector2 toShip = (Vector2)transform.position - center;
-        float radius = toShip.magnitude;
-        Vector2 tangent = new(-orbitDirection * toShip.y, orbitDirection * toShip.x);
-        tangent.Normalize();
 
-        /* Track forces for optional logging */
-        Vector2 radialForce = Vector2.zero;
-        Vector2 tangentialForce = Vector2.zero;
-        Vector2 boostForce = Vector2.zero;
-
-        /* 1. Radial assistance */
-        float rError = radius - targetOrbitRadius;
-        if (enableOrbitAssistance && Mathf.Abs(rError) > 0.05f)
-        {
-            Vector2 radialDir = toShip.normalized;
-            float radialVel = Vector2.Dot(rb.velocity, radialDir);
-
-            float assistMult = isBoosting ? 2.5f : 1f;
-            if (Mathf.Abs(radialVel) > maxRadialApproachSpeed)
-            {
-                Vector2 damping = -radialDir * radialVel * 2f * assistMult;
-                rb.AddForce(damping, ForceMode2D.Force);
-                radialForce += damping;
-            }
-
-            Vector2 correction = -radialDir * rError * radialAssistForce * assistMult;
-            rb.AddForce(correction, ForceMode2D.Force);
-            radialForce += correction;
-
-            if (logOrbitPhysics && enableDebugLogs)
-                Debug.Log($"[ORBIT] Radius: {radius:F2}, Target: {targetOrbitRadius:F2}, Error: {rError:F2}, RadialVel: {radialVel:F2}, Multiplier: {assistMult:F1}");
-        }
-
-        /* 2. Tangential hold  (runs ONLY when not boosting) */
-        float tangentialNow = Vector2.Dot(rb.velocity, tangent);
-
-        if (!isBoosting)                           // *** MODIFIED ***
-        {
-            float speedError = lockedTangentialSpeed - tangentialNow;
-            if (Mathf.Abs(speedError) > tangentialHoldTolerance)
-            {
-                Vector2 holdForce = tangent * speedError * tangentialHoldForce;
-                rb.AddForce(holdForce, ForceMode2D.Force);
-                tangentialForce += holdForce;
-            }
-
-            if (logOrbitPhysics && enableDebugLogs)
-                Debug.Log($"[ORBIT] TangentialNow: {tangentialNow:F2}, Locked: {lockedTangentialSpeed:F2}, Error: {(lockedTangentialSpeed - tangentialNow):F2}");
-        }
-        else                                        // *** MODIFIED ***
-        {
-            // While boosting, always keep the reference synced
-            lockedTangentialSpeed = tangentialNow;
-        }
-
-        /* 3. Boost adds momentum */
+        // Calculate orbital speed (with boost if active)
+        float effectiveSpeed = currentOrbitalSpeed;
         if (isBoosting && HasFuel())
         {
-            Vector2 currentBoostForce = tangent * thrustForce * orbitalSpeedBoost;
-            rb.AddForce(currentBoostForce, ForceMode2D.Force);
-            boostForce = currentBoostForce;
-
-            // *** MODIFIED ***  Instantly synchronise reference speed
-            float newTangentialSpeed = Vector2.Dot(rb.velocity + (currentBoostForce / shipMass) * Time.fixedDeltaTime, tangent);
-            lockedTangentialSpeed = newTangentialSpeed;
-
-            if (logBoostDetails && enableDebugLogs)
-            {
-                Debug.Log($"[BOOST] Force Applied: {currentBoostForce.magnitude:F2}, Dir: {currentBoostForce.normalized}");
-                Debug.Log($"[BOOST] LockedTangential updated to: {lockedTangentialSpeed:F2}");
-                Debug.Log($"[BOOST] Total Velocity: {rb.velocity.magnitude:F2}");
-            }
+            effectiveSpeed *= orbitalBoostMultiplier;
+            ConsumeFuel(boostFuelConsumption);
         }
 
-        /* Smooth UI radius */
-        currentOrbitRadius = Mathf.Lerp(currentOrbitRadius, targetOrbitRadius,
-                                        orbitTransitionSpeed * Time.fixedDeltaTime);
+        // Update orbital angle
+        float angularVelocity = effectiveSpeed / orbitRadius;
+        orbitAngle += angularVelocity * orbitDirection * Time.fixedDeltaTime;
 
-        /* Optional force logging */
-        if (logForces && enableDebugLogs &&
-           (radialForce.sqrMagnitude > 0.01f || tangentialForce.sqrMagnitude > 0.01f || boostForce.sqrMagnitude > 0.01f))
+        // Calculate new position on orbit
+        Vector2 newPosition = center + new Vector2(
+            Mathf.Cos(orbitAngle) * orbitRadius,
+            Mathf.Sin(orbitAngle) * orbitRadius
+        );
+
+        // Set position directly (no physics forces)
+        transform.position = newPosition;
+
+        // Calculate orbital velocity for display purposes
+        Vector2 tangent = new Vector2(-Mathf.Sin(orbitAngle), Mathf.Cos(orbitAngle)) * orbitDirection;
+        Vector2 orbitalVelocity = tangent * effectiveSpeed;
+        rb.velocity = orbitalVelocity;
+
+        if (logOrbitPhysics && enableDebugLogs)
         {
-            Debug.Log($"[FORCES] Radial: {radialForce.magnitude:F2}, Tangential: {tangentialForce.magnitude:F2}, Boost: {boostForce.magnitude:F2}");
+            Debug.Log($"[ORBIT] Radius: {orbitRadius:F2}, Speed: {effectiveSpeed:F2}, Angle: {orbitAngle * Mathf.Rad2Deg:F1}°");
+        }
+    }
+
+    void ApplyMinorGravitationalInfluences()
+    {
+        if (!lockedBody) return;
+
+        Vector2 totalInfluence = Vector2.zero;
+        Vector2 center = lockedBody.transform.position;
+
+        // Check influences from other bodies (not the locked one)
+        foreach (var body in gravityBodies)
+        {
+            if (!body || body == lockedBody) continue;
+
+            float dist = Vector2.Distance(transform.position, body.transform.position);
+            if (dist > body.GetInfluenceRadius()) continue;
+
+            Vector2 influence = body.GetGravitationalForceOn(shipMass, transform.position);
+
+            // Only apply a fraction of the influence to maintain stable orbit
+            totalInfluence += influence * 0.1f; // Reduce influence to 10%
         }
 
-        lastVelocity = rb.velocity;
+        if (totalInfluence.sqrMagnitude > 0.01f)
+        {
+            // Apply minor positional adjustment
+            Vector2 adjustment = totalInfluence * Time.fixedDeltaTime * Time.fixedDeltaTime / shipMass;
+            transform.position += (Vector3)adjustment;
+
+            // Recalculate orbit parameters based on new position
+            Vector2 newRelativePos = (Vector2)transform.position - center;
+            orbitRadius = newRelativePos.magnitude;
+            orbitAngle = Mathf.Atan2(newRelativePos.y, newRelativePos.x);
+
+            if (enableDebugLogs)
+                Debug.Log($"[ORBIT] Minor gravitational adjustment: {adjustment.magnitude:F4}");
+        }
     }
 
     /*────────────────────── LOCK / BREAK ───────────────────────*/
@@ -311,23 +371,27 @@ public class SpaceshipController2D : MonoBehaviour
         isOrbitLocked = true;
 
         Vector2 center = body.transform.position;
-        Vector2 rel = (Vector2)transform.position - center;
+        Vector2 relativePos = (Vector2)transform.position - center;
 
-        orbitDirection = Mathf.Sign(Vector2.Dot(new Vector2(-rel.y, rel.x), rb.velocity));
-        currentOrbitRadius = rel.magnitude;
-        targetOrbitRadius = currentOrbitRadius;
+        // Set initial orbit parameters
+        orbitRadius = Mathf.Max(relativePos.magnitude, minimumOrbitRadius);
+        orbitAngle = Mathf.Atan2(relativePos.y, relativePos.x);
 
-        Vector2 tangent = new(-rel.y, rel.x); tangent.Normalize();
-        lockedTangentialSpeed = Vector2.Dot(rb.velocity, tangent);
+        // Determine orbit direction based on current velocity
+        Vector2 velocityDirection = rb.velocity.normalized;
+        Vector2 tangent = new Vector2(-relativePos.y, relativePos.x).normalized;
+        orbitDirection = Mathf.Sign(Vector2.Dot(velocityDirection, tangent));
+        if (orbitDirection == 0) orbitDirection = 1f; // Default to CCW
 
-        // Project velocity onto tangent
-        rb.velocity = tangent * lockedTangentialSpeed;
+        // Set orbital speed based on current velocity or default
+        float currentSpeed = rb.velocity.magnitude;
+        currentOrbitalSpeed = currentSpeed > 0.5f ? currentSpeed : baseOrbitalSpeed;
 
         if (enableDebugLogs)
         {
             Debug.Log($"[ORBIT] LOCKED to {body.name}");
-            Debug.Log($"[ORBIT] Radius: {currentOrbitRadius:F2}, Dir: {(orbitDirection > 0 ? "CCW" : "CW")}");
-            Debug.Log($"[ORBIT] Tangential Speed: {lockedTangentialSpeed:F2}");
+            Debug.Log($"[ORBIT] Radius: {orbitRadius:F2}, Speed: {currentOrbitalSpeed:F2}");
+            Debug.Log($"[ORBIT] Direction: {(orbitDirection > 0 ? "CCW" : "CW")}");
         }
 
         if (lineDrawerObject) lineDrawerObject.SetActive(true);
@@ -340,13 +404,43 @@ public class SpaceshipController2D : MonoBehaviour
         if (enableDebugLogs)
             Debug.Log($"[ORBIT] BREAKING orbit from {(lockedBody ? lockedBody.name : "null")}");
 
+        // Calculate tangential velocity for breaking orbit
+        Vector2 tangent = new Vector2(-Mathf.Sin(orbitAngle), Mathf.Cos(orbitAngle)) * orbitDirection;
+        rb.velocity = tangent * currentOrbitalSpeed;
+
         isOrbitLocked = false;
         lockedBody = null;
+
         if (lineDrawerObject) lineDrawerObject.SetActive(false);
     }
 
     /*──────────────────────── FORCES ───────────────────────────*/
-    void ApplyThrust() => rb.AddForce(transform.up * thrustForce, ForceMode2D.Force);
+    void ApplyThrust()
+    {
+        rb.AddForce(transform.up * thrustForce, ForceMode2D.Force);
+        ConsumeFuel(thrustFuelConsumption);
+    }
+
+    void ApplyBreaking()
+    {
+        if (isOrbitLocked)
+        {
+            // In orbit: reduce orbital speed
+            currentOrbitalSpeed = Mathf.Max(currentOrbitalSpeed * 0.98f, baseOrbitalSpeed * 0.5f);
+        }
+        else
+        {
+            // Free flight: apply breaking force
+            if (rb.velocity.magnitude < 0.1f) return;
+            Vector2 breakingForce = -rb.velocity.normalized * thrustForce * 0.8f;
+            rb.AddForce(breakingForce, ForceMode2D.Force);
+        }
+
+        ConsumeFuel(breakFuelConsumption);
+
+        if (enableDebugLogs)
+            Debug.Log("[BREAKING] Slowing down");
+    }
 
     void ApplyGravity()
     {
@@ -392,25 +486,73 @@ public class SpaceshipController2D : MonoBehaviour
         rb.rotation = Mathf.LerpAngle(rb.rotation, a, 8f * Time.fixedDeltaTime);
     }
 
+    void RotateSpriteToOrbitalDirection()
+    {
+        if (!isOrbitLocked) return;
+
+        // Rotate sprite to face orbital direction
+        Vector2 tangent = new Vector2(-Mathf.Sin(orbitAngle), Mathf.Cos(orbitAngle)) * orbitDirection;
+        float a = Mathf.Atan2(tangent.y, tangent.x) * Mathf.Rad2Deg - 90f;
+        rb.rotation = Mathf.LerpAngle(rb.rotation, a, 8f * Time.fixedDeltaTime);
+    }
+
+    /*────────────────────── MOBILE UI METHODS ──────────────────────────*/
+    public void OnBoostToggle(bool enabled)
+    {
+        if (isMobileMode)
+            boostToggleEnabled = enabled;
+    }
+
+    public void OnOrbitButtonDown()
+    {
+        if (isMobileMode)
+        {
+            // Mobile orbit functionality
+        }
+    }
+
+    public void OnOrbitButtonUp()
+    {
+        if (isMobileMode)
+        {
+            // Handle orbit release for mobile
+        }
+    }
+
+    public void OnBreakButtonDown()
+    {
+        if (isMobileMode)
+        {
+            isBreaking = true;
+        }
+    }
+
+    public void OnBreakButtonUp()
+    {
+        if (isMobileMode)
+        {
+            isBreaking = false;
+        }
+    }
+
+    public void OnOrbitRadiusChange(float delta)
+    {
+        if (isMobileMode && isOrbitLocked)
+        {
+            orbitRadius += delta;
+            orbitRadius = Mathf.Clamp(orbitRadius, minimumOrbitRadius, maximumOrbitRadius);
+        }
+    }
+
     /*────────────────────── DEBUG LOGGING ──────────────────────*/
     void LogPeriodicDebugInfo()
     {
-        Debug.Log($"[STATUS] Mode: {(isOrbitLocked ? "ORBIT" : "FREE")}, Velocity: {rb.velocity.magnitude:F2}, Fuel: {currentFuel:F1}%");
+        string mode = isOrbitLocked ? "ORBIT" : "FREE";
+        Debug.Log($"[STATUS] Mode: {mode}, Velocity: {rb.velocity.magnitude:F2}, Fuel: {currentFuel:F1}%");
 
         if (isOrbitLocked && lockedBody)
         {
-            Vector2 center = lockedBody.transform.position;
-            Vector2 toShip = (Vector2)transform.position - center;
-
-            float actualRadius = toShip.magnitude;
-
-            Vector2 tangent = new(-orbitDirection * toShip.y, orbitDirection * toShip.x);
-            tangent.Normalize();
-            float actualTangential = Vector2.Dot(rb.velocity, tangent);
-
-            Debug.Log($"[ORBIT STATUS] ActualRadius: {actualRadius:F2}, TargetRadius: {targetOrbitRadius:F2}");
-            Debug.Log($"[ORBIT STATUS] ActualTangential: {actualTangential:F2}, LockedTangential: {lockedTangentialSpeed:F2}");
-            Debug.Log($"[ORBIT STATUS] RadiusError: {(actualRadius - targetOrbitRadius):F2}, SpeedError: {(lockedTangentialSpeed - actualTangential):F2}");
+            Debug.Log($"[ORBIT STATUS] Radius: {orbitRadius:F2}, Speed: {currentOrbitalSpeed:F2}, Angle: {orbitAngle * Mathf.Rad2Deg:F1}°");
         }
     }
 
@@ -418,13 +560,14 @@ public class SpaceshipController2D : MonoBehaviour
     void UpdateOrbitVisualisation()
     {
         if (!lineDrawerObject) return;
+
         var pred = lineDrawerObject.GetComponent<TrajectoryPredictor>();
         if (!pred) return;
 
         if (isOrbitLocked && lockedBody)
         {
             if (!lineDrawerObject.activeSelf) lineDrawerObject.SetActive(true);
-            pred.ShowCircularOrbit(lockedBody.transform.position, currentOrbitRadius);
+            pred.ShowCircularOrbit(lockedBody.transform.position, orbitRadius);
             return;
         }
 
@@ -440,10 +583,8 @@ public class SpaceshipController2D : MonoBehaviour
         if (near && Vector2.Distance(transform.position, near.transform.position) <= near.GetInfluenceRadius())
         {
             if (!lineDrawerObject.activeSelf) lineDrawerObject.SetActive(true);
-            pred.PredictTrajectory(transform.position, rb.velocity,
-                                   gravityBodies, shipMass,
-                                   minimumGravityDistance, maxSpeed,
-                                   isThrusting && HasFuel(), transform.up, thrustForce);
+            pred.PredictTrajectory(transform.position, rb.velocity, gravityBodies, shipMass,
+                minimumGravityDistance, maxSpeed, isThrusting && HasFuel(), transform.up, thrustForce);
         }
         else
         {
@@ -457,8 +598,14 @@ public class SpaceshipController2D : MonoBehaviour
     {
         if (speedText) speedText.text = (rb.velocity.magnitude * 10f).ToString("F1");
         if (fuelText) fuelText.text = $"Fuel: {currentFuel:F1}%";
-        if (modeText) modeText.text = isOrbitLocked ? "Mode: ORBIT LOCKED" : "Mode: FREE FLIGHT";
-        if (orbitRadiusText) orbitRadiusText.text = isOrbitLocked ? $"Orbit: {currentOrbitRadius:F1}" : "Orbit: --";
+        if (modeText)
+        {
+            string mode = isOrbitLocked ? "ORBIT LOCKED" : "FREE FLIGHT";
+            if (isBoosting) mode += " + BOOST";
+            if (isBreaking) mode += " + BREAK";
+            modeText.text = $"Mode: {mode}";
+        }
+        if (orbitRadiusText) orbitRadiusText.text = isOrbitLocked ? $"Orbit: {orbitRadius:F1}" : "Orbit: --";
 
         if (speedometerNeedle)
         {
@@ -473,14 +620,16 @@ public class SpaceshipController2D : MonoBehaviour
     {
         if (!thrusterEffect) return;
 
-        bool play = ((isThrusting && !isOrbitLocked) || isBoosting) && HasFuel();
+        bool play = (isThrusting || isBoosting || isBreaking) && HasFuel();
+
         if (play && !thrusterEffect.isPlaying) thrusterEffect.Play();
         else if (!play && thrusterEffect.isPlaying) thrusterEffect.Stop();
     }
 
     /*──────────────────── FUEL / BODIES ───────────────────────*/
     bool HasFuel() => currentFuel > 0f;
-    void ConsumeFuel(float r) => currentFuel = Mathf.Max(0f, currentFuel - r * Time.deltaTime);
+
+    void ConsumeFuel(float rate) => currentFuel = Mathf.Max(0f, currentFuel - rate * Time.deltaTime);
 
     public void RefreshGravitationalBodies()
     {
@@ -490,4 +639,3 @@ public class SpaceshipController2D : MonoBehaviour
             Debug.Log($"[INIT] Found {gravityBodies.Count} gravitational bodies");
     }
 }
-
